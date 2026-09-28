@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# Watch open, non-draft PRs involving you. Notifies on new ones, on @-mentions and on
+# replies in review threads you commented in. Auto-approves PRs carrying the approve
+# label (unless authored by you or you requested changes).
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+Usage: ssa-watch -r owner/repo [-r owner/repo]... [-i seconds] [-l label] [-n]
+  -r  repo to watch, repeatable (required)
+  -i  poll interval in seconds (default: 60)
+  -l  label that triggers auto-approve (default: ssa-ship)
+  -n  dry run: log instead of approving
+EOF
+}
+
+repos=()
+interval=60
+approve_label="ssa-ship"
+dry_run=false
+
+while getopts "r:i:l:nh" opt; do
+  case $opt in
+    r) repos+=("$OPTARG") ;;
+    i) interval=$OPTARG ;;
+    l) approve_label=$OPTARG ;;
+    n) dry_run=true ;;
+    h) usage; exit 0 ;;
+    *) usage; exit 1 ;;
+  esac
+done
+if [ ${#repos[@]} -eq 0 ]; then
+  usage >&2
+  exit 1
+fi
+
+state_dir="${XDG_CACHE_HOME:-$HOME/.cache}/ssa-watch"
+repos_key=$(printf '%s\n' "${repos[@]}" | sort | shasum | cut -c1-12)
+seen_file="$state_dir/seen-$repos_key"
+comments_file="$state_dir/comments-$repos_key"
+mkdir -p "$state_dir"
+
+me=$(gh api user -q .login)
+failed_approvals=" "
+
+is_tty=false
+if [ -t 1 ]; then
+  is_tty=true
+  c_reset=$'\e[0m' c_bold=$'\e[1m' c_dim=$'\e[2m' c_red=$'\e[31m' c_green=$'\e[32m'
+  c_yellow=$'\e[33m' c_magenta=$'\e[35m' c_cyan=$'\e[36m'
+else
+  c_reset="" c_bold="" c_dim="" c_red="" c_green="" c_yellow="" c_magenta="" c_cyan=""
+fi
+
+log() { printf '%s[%s]%s %s\n' "$c_dim" "$(date +%H:%M:%S)" "$c_reset" "$*"; }
+
+notify() {
+  local title=$1 message=$2 url=$3
+
+  if command -v terminal-notifier >/dev/null; then
+    # Piped: -message parses values starting with brackets, quotes or "<"
+    printf '%s' "$message" | terminal-notifier -title "$title" -open "$url" -sound default >/dev/null ||
+      log "Notification failed: $title"
+    return
+  fi
+
+  osascript -e 'on run argv' \
+    -e 'display notification (item 2 of argv) with title (item 1 of argv) sound name "default"' \
+    -e 'end run' "$title" "$message" || log "Notification failed: $title"
+}
+
+# Fields are joined by \x1f, not tabs: bash's read collapses consecutive tabs, dropping empty fields
+sep=$'\x1f'
+
+# Capped at 30 PRs: GraphQL cost scales with requested page sizes (~14 points per poll)
+fetch_prs() {
+  local query="is:pr is:open draft:false involves:@me" repo
+  for repo in "${repos[@]}"; do query+=" repo:$repo"; done
+
+  gh api graphql -f q="$query" -f query='
+    query($q: String!) {
+      search(query: $q, type: ISSUE, first: 30) {
+        nodes {
+          ... on PullRequest {
+            number title url reviewDecision
+            author { login }
+            repository { nameWithOwner }
+            labels(first: 20) { nodes { name } }
+            commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+            comments(last: 30) { nodes { ...c } }
+            reviews(last: 20) { nodes { ...c } }
+            reviewThreads(last: 20) {
+              nodes {
+                root: comments(first: 1) { nodes { ...c } }
+                recent: comments(last: 10) { nodes { ...c } }
+              }
+            }
+          }
+        }
+      }
+    }
+    fragment c on Comment {
+      id body createdAt
+      author { login }
+      ... on IssueComment { url }
+      ... on PullRequestReview { url }
+      ... on PullRequestReviewComment { url }
+    }'
+}
+
+pr_rows() {
+  jq -r '.data.search.nodes[] | [
+    .repository.nameWithOwner, (.number | tostring), (.author.login // "ghost"), .url,
+    ([.labels.nodes[].name] | join(",")), (.reviewDecision // ""),
+    (.commits.nodes[0].commit.statusCheckRollup.state // ""), .title
+  ] | join("\u001f")' <<<"$1"
+}
+
+# One row per comment by someone else that @-mentions you, or that follows your
+# comment in a review thread. Mentions win when a comment is both.
+comment_events() {
+  jq -r --arg me "$me" '
+    def by_me: (.author.login // "") == $me;
+    .data.search.nodes[]
+    | .repository.nameWithOwner as $repo | (.number | tostring) as $number
+    | [
+        ((.comments.nodes[], .reviews.nodes[], (.reviewThreads.nodes[] | .root.nodes[], .recent.nodes[]))
+          | select((by_me | not) and (.body | test("(^|[^\\w-])@" + $me + "(?![\\w-])"; "i")))
+          | . + {kind: "mention"}),
+        (.reviewThreads.nodes[]
+          | ([.root.nodes[], .recent.nodes[]] | unique_by(.id)) as $thread
+          | ([$thread[] | select(by_me) | .createdAt] | min) as $mine
+          | select($mine != null)
+          | $thread[] | select((by_me | not) and .createdAt > $mine)
+          | . + {kind: "reply"})
+      ]
+    | unique_by(.id)[]
+    | [.id, .kind, $repo, $number, (.author.login // "ghost"), .url,
+       (.body | gsub("<!--[\\s\\S]*?-->"; "") | gsub("\\s+"; " ") | ltrimstr(" ") | .[0:120])]
+    | join("\u001f")' <<<"$1"
+}
+
+my_review_state() {
+  gh api "repos/$1/pulls/$2/reviews" --paginate \
+    --jq ".[] | select(.user.login == \"$me\" and .state != \"COMMENTED\" and .state != \"PENDING\") | .state" |
+    tail -n1
+}
+
+maybe_approve() {
+  local repo=$1 number=$2 url=$3 title=$4 state
+
+  [[ $failed_approvals == *" $url "* ]] && return
+
+  if ! state=$(my_review_state "$repo" "$number"); then
+    log "Review lookup failed for $url"
+    return
+  fi
+  [[ $state == APPROVED || $state == CHANGES_REQUESTED ]] && return
+
+  if $dry_run; then
+    log "DRY RUN: would approve $url"
+    return
+  fi
+
+  if ! gh pr review "$number" -R "$repo" --approve >/dev/null; then
+    log "Approve failed for $url, not retrying"
+    failed_approvals+="$url "
+    return
+  fi
+
+  log "Approved $url"
+  notify "Auto-approved #$number" "$title" "$url"
+}
+
+# Pads by character count; printf's %-Ns pads by bytes, which breaks on non-ASCII
+pad() { printf '%s%*s' "$1" $(($2 - ${#1})) ''; }
+
+# OSC 8 hyperlink, only on a TTY; the padding stays outside the link
+link_cell() {
+  local url=$1 text=$2 width=$3
+  if $is_tty; then
+    printf '\e]8;;%s\e\\%s\e]8;;\e\\' "$url" "$text"
+  else
+    printf '%s' "$text"
+  fi
+  printf '%*s' $((width - ${#text})) ''
+}
+
+repeat() {
+  local s
+  printf -v s '%*s' "$2" ''
+  printf '%s' "${s// /$1}"
+}
+
+label_color() {
+  case $1 in
+    ssa-ship) printf '%s' "$c_green" ;;
+    ssa-show) printf '%s' "$c_yellow" ;;
+    ssa-ask) printf '%s' "$c_red" ;;
+    *) printf '%s' "$c_dim" ;;
+  esac
+}
+
+colored() { printf '%s%s%s' "$1" "$(pad "$2" "$3")" "$c_reset"; }
+
+review_cell() {
+  case $1 in
+    APPROVED) colored "$c_green" approved "$2" ;;
+    CHANGES_REQUESTED) colored "$c_red" changes "$2" ;;
+    REVIEW_REQUIRED) colored "$c_yellow" pending "$2" ;;
+    *) colored "$c_dim" - "$2" ;;
+  esac
+}
+
+ci_cell() {
+  case $1 in
+    SUCCESS) colored "$c_green" "✓ passed" "$2" ;;
+    FAILURE | ERROR) colored "$c_red" "✗ failed" "$2" ;;
+    PENDING | EXPECTED) colored "$c_yellow" "● running" "$2" ;;
+    *) colored "$c_dim" - "$2" ;;
+  esac
+}
+
+print_list() {
+  local rows=$1 repo number author url labels review ci title count=0
+  local w_repo=4 w_num=4 w_author=6 w_title=5 w_labels=6 w_review=8 w_ci=9
+
+  while IFS=$sep read -r repo number author url labels review ci title; do
+    [ -z "$url" ] && continue
+    count=$((count + 1))
+    labels=${labels//,/, }
+    [ ${#repo} -gt $w_repo ] && w_repo=${#repo}
+    [ $((${#number} + 1)) -gt $w_num ] && w_num=$((${#number} + 1))
+    [ ${#author} -gt $w_author ] && w_author=${#author}
+    [ ${#title} -gt $w_title ] && w_title=${#title}
+    [ ${#labels} -gt $w_labels ] && w_labels=${#labels}
+  done <<<"$rows"
+
+  log "${#repos[@]} repo(s), $count open PR(s)"
+  [ $count -eq 0 ] && return
+
+  local cols
+  cols=$({ stty size </dev/tty; } 2>/dev/null | cut -d' ' -f2) || true
+  local max_title=$((${cols:-${COLUMNS:-160}} - w_repo - w_num - w_author - w_labels - w_review - w_ci - 22))
+  [ $max_title -lt 20 ] && max_title=20
+  [ $w_title -gt $max_title ] && w_title=$max_title
+
+  local b="${c_dim}│${c_reset}"
+  border() {
+    printf '%s%s' "$c_dim" "$1"
+    printf '%s%s' "$(repeat ─ $((w_repo + 2)))" "$2"
+    printf '%s%s' "$(repeat ─ $((w_num + 2)))" "$2"
+    printf '%s%s' "$(repeat ─ $((w_author + 2)))" "$2"
+    printf '%s%s' "$(repeat ─ $((w_title + 2)))" "$2"
+    printf '%s%s' "$(repeat ─ $((w_review + 2)))" "$2"
+    printf '%s%s' "$(repeat ─ $((w_ci + 2)))" "$2"
+    printf '%s%s%s\n' "$(repeat ─ $((w_labels + 2)))" "$3" "$c_reset"
+  }
+
+  border ┌ ┬ ┐
+  printf '%s %s%s%s %s %s%s%s %s %s%s%s %s %s%s%s %s %s%s%s %s %s%s%s %s %s%s%s %s\n' \
+    "$b" "$c_bold" "$(pad Repo $w_repo)" "$c_reset" \
+    "$b" "$c_bold" "$(pad PR $w_num)" "$c_reset" \
+    "$b" "$c_bold" "$(pad Author $w_author)" "$c_reset" \
+    "$b" "$c_bold" "$(pad Title $w_title)" "$c_reset" \
+    "$b" "$c_bold" "$(pad Review $w_review)" "$c_reset" \
+    "$b" "$c_bold" "$(pad CI $w_ci)" "$c_reset" \
+    "$b" "$c_bold" "$(pad Labels $w_labels)" "$c_reset" "$b"
+  border ├ ┼ ┤
+
+  local author_color label labels_cell labels_len
+  while IFS=$sep read -r repo number author url labels review ci title; do
+    [ -z "$url" ] && continue
+
+    [ ${#title} -gt $w_title ] && title="${title:0:$((w_title - 1))}…"
+
+    author_color=""
+    [ "$author" = "$me" ] && author_color=$c_cyan
+
+    labels_cell=""
+    labels_len=${#labels}
+    [ -n "$labels" ] && labels_len=$((labels_len + $(tr -cd , <<<"$labels" | wc -c)))
+    while IFS= read -r label; do
+      [ -z "$label" ] && continue
+      [ -n "$labels_cell" ] && labels_cell+="$c_dim, $c_reset"
+      labels_cell+="$(label_color "$label")$label$c_reset"
+    done <<<"${labels//,/$'\n'}"
+
+    printf '%s %s %s %s%s%s %s %s%s%s %s %s %s %s %s %s %s %s%*s %s\n' \
+      "$b" "$(pad "$repo" $w_repo)" \
+      "$b" "$c_magenta" "$(link_cell "$url" "#$number" $w_num)" "$c_reset" \
+      "$b" "$author_color" "$(pad "$author" $w_author)" "$c_reset" \
+      "$b" "$(link_cell "$url" "$title" $w_title)" \
+      "$b" "$(review_cell "$review" $w_review)" \
+      "$b" "$(ci_cell "$ci" $w_ci)" \
+      "$b" "$labels_cell" $((w_labels - labels_len)) '' "$b"
+  done <<<"$rows"
+  border └ ┴ ┘
+}
+
+log "Watching ${repos[*]} as $me every ${interval}s (auto-approve: $approve_label)"
+first_poll=true
+
+while true; do
+  if ! raw=$(fetch_prs); then
+    log "Fetch failed, retrying in ${interval}s"
+    sleep "$interval"
+    continue
+  fi
+
+  prs=$(pr_rows "$raw")
+  events=$(comment_events "$raw")
+  current=$(cut -d"$sep" -f4 <<<"$prs" | sed '/^$/d' | sort)
+
+  new_urls=""
+  [ -f "$seen_file" ] && new_urls=$(comm -13 "$seen_file" <(printf '%s\n' "$current") | sed '/^$/d')
+  if $first_poll || [ -n "$new_urls" ] || [ "$current" != "$(cat "$seen_file")" ]; then
+    print_list "$prs"
+  fi
+  first_poll=false
+  printf '%s\n' "$current" >"$seen_file"
+
+  # fd 3 keeps gh/osascript from consuming the loop's input
+  while IFS=$sep read -r repo number author url labels review ci title <&3; do
+    [ -z "$url" ] && continue
+
+    if grep -qxF "$url" <<<"$new_urls"; then
+      log "New: $url"
+      notify "New PR #$number ($repo)" "$title - by $author" "$url"
+    fi
+
+    [ "$author" = "$me" ] && continue
+    [[ ",$labels," == *",$approve_label,"* ]] && maybe_approve "$repo" "$number" "$url" "$title"
+  done 3<<<"$prs"
+
+  if [ -f "$comments_file" ]; then
+    while IFS=$sep read -r id kind repo number author url snippet <&3; do
+      [ -z "$id" ] && continue
+      grep -qxF "$id" "$comments_file" && continue
+
+      verb="replied to you"
+      [ "$kind" = mention ] && verb="mentioned you"
+      log "@$author $verb on $repo#$number: $url"
+      notify "@$author $verb on #$number" "$snippet" "$url"
+    done 3<<<"$events"
+  fi
+  { [ -f "$comments_file" ] && cat "$comments_file"; cut -d"$sep" -f1 <<<"$events"; } |
+    sed '/^$/d' | awk '!seen[$0]++' | tail -n 5000 >"$comments_file.tmp"
+  mv "$comments_file.tmp" "$comments_file"
+
+  sleep "$interval"
+done
