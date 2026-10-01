@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Watch open, non-draft PRs involving you. Notifies on new ones, on @-mentions and on
 # replies in review threads you commented in. Auto-approves PRs carrying the approve
-# label (unless authored by you or you requested changes).
+# label (unless authored by you, you requested changes, or it touches an -x path).
 set -euo pipefail
 
 usage() {
   cat <<EOF
-Usage: ssa-watch -r owner/repo [-r owner/repo]... [-i seconds] [-l label] [-n]
+Usage: ssa-watch -r owner/repo [-r owner/repo]... [-i seconds] [-l label] [-x path]... [-n]
   -r  repo to watch, repeatable (required)
   -i  poll interval in seconds (default: 60)
   -l  label that triggers auto-approve (default: ssa-ship)
+  -x  never auto-approve PRs changing files under this path, repeatable
   -n  dry run: log instead of approving
 EOF
 }
@@ -17,13 +18,15 @@ EOF
 repos=()
 interval=60
 approve_label="ssa-ship"
+excluded_paths=()
 dry_run=false
 
-while getopts "r:i:l:nh" opt; do
+while getopts "r:i:l:x:nh" opt; do
   case $opt in
     r) repos+=("$OPTARG") ;;
     i) interval=$OPTARG ;;
     l) approve_label=$OPTARG ;;
+    x) excluded_paths+=("${OPTARG%/}") ;;
     n) dry_run=true ;;
     h) usage; exit 0 ;;
     *) usage; exit 1 ;;
@@ -42,6 +45,7 @@ mkdir -p "$state_dir"
 
 me=$(gh api user -q .login)
 failed_approvals=" "
+blocked_approvals=" "
 
 is_tty=false
 if [ -t 1 ]; then
@@ -146,8 +150,23 @@ my_review_state() {
     tail -n1
 }
 
+# Prints the PR's changed files that fall under an -x path
+excluded_files() {
+  local files file path
+  [ ${#excluded_paths[@]} -eq 0 ] && return
+
+  files=$(gh api "repos/$1/pulls/$2/files" --paginate --jq '.[].filename') || return
+  while IFS= read -r file; do
+    for path in "${excluded_paths[@]}"; do
+      case $file in
+        "$path" | "$path"/*) printf '%s\n' "$file" && break ;;
+      esac
+    done
+  done <<<"$files"
+}
+
 maybe_approve() {
-  local repo=$1 number=$2 url=$3 title=$4 state
+  local repo=$1 number=$2 url=$3 title=$4 state blocked
 
   [[ $failed_approvals == *" $url "* ]] && return
 
@@ -156,6 +175,18 @@ maybe_approve() {
     return
   fi
   [[ $state == APPROVED || $state == CHANGES_REQUESTED ]] && return
+
+  if ! blocked=$(excluded_files "$repo" "$number"); then
+    log "File lookup failed for $url"
+    return
+  fi
+  if [ -n "$blocked" ]; then
+    [[ $blocked_approvals == *" $url "* ]] && return
+    blocked_approvals+="$url "
+    log "Not auto-approving $url: changes $(head -n1 <<<"$blocked")"
+    notify "Not auto-approving #$number" "Changes $(head -n1 <<<"$blocked")" "$url"
+    return
+  fi
 
   if $dry_run; then
     log "DRY RUN: would approve $url"
