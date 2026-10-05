@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Watch open, non-draft PRs involving you. Notifies on new ones, on @-mentions and on
-# replies in review threads you commented in. Auto-approves PRs carrying the approve
+# Watch open, non-draft PRs involving you. Notifies on new ones, on @-mentions, on
+# replies in review threads you commented in, and on comments and reviews on your PRs. Auto-approves PRs carrying the approve
 # label (unless authored by you, you requested changes, or it touches an -x path).
 set -euo pipefail
 
@@ -40,7 +40,7 @@ fi
 state_dir="${XDG_CACHE_HOME:-$HOME/.cache}/ssa-watch"
 repos_key=$(printf '%s\n' "${repos[@]}" | sort | shasum | cut -c1-12)
 seen_file="$state_dir/seen-$repos_key"
-comments_file="$state_dir/comments-$repos_key"
+events_file="$state_dir/events-$repos_key"
 mkdir -p "$state_dir"
 
 me=$(gh api user -q .login)
@@ -76,7 +76,7 @@ notify() {
 # Fields are joined by \x1f, not tabs: bash's read collapses consecutive tabs, dropping empty fields
 sep=$'\x1f'
 
-# Capped at 30 PRs: GraphQL cost scales with requested page sizes (~14 points per poll)
+# Capped at 30 PRs: GraphQL cost scales with requested page sizes (~20 points per poll)
 fetch_prs() {
   local query="is:pr is:open draft:false involves:@me" repo
   for repo in "${repos[@]}"; do query+=" repo:$repo"; done
@@ -92,7 +92,7 @@ fetch_prs() {
             labels(first: 20) { nodes { name } }
             commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
             comments(last: 30) { nodes { ...c } }
-            reviews(last: 20) { nodes { ...c } }
+            reviews(last: 20) { nodes { ...c state comments(first: 1) { totalCount nodes { body } } } }
             reviewThreads(last: 20) {
               nodes {
                 root: comments(first: 1) { nodes { ...c } }
@@ -120,18 +120,27 @@ pr_rows() {
   ] | join("\u001f")' <<<"$1"
 }
 
-# One row per comment by someone else that @-mentions you, or that follows your
-# comment in a review thread. Mentions win when a comment is both.
+# One row per comment or review by someone else that matters to you. On your own PRs:
+# every conversation comment and every review (inline comments roll up into their
+# review). Elsewhere: @-mentions, and comments following yours in a review thread.
+# Earlier kinds win when a comment matches several.
 comment_events() {
   jq -r --arg me "$me" '
     def by_me: (.author.login // "") == $me;
     .data.search.nodes[]
-    | .repository.nameWithOwner as $repo | (.number | tostring) as $number
+    | .repository.nameWithOwner as $repo | (.number | tostring) as $number | .title as $title
+    | (.author.login == $me) as $my_pr
     | [
-        ((.comments.nodes[], .reviews.nodes[], (.reviewThreads.nodes[] | .root.nodes[], .recent.nodes[]))
+        (select($my_pr) | .reviews.nodes[]
+          | select((by_me | not) and (.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "COMMENTED"))
+          | select(.state != "COMMENTED" or .body != "" or .comments.totalCount > 0)
+          | .body = (if .body == "" then .comments.nodes[0].body // "" else .body end)
+          | . + {kind: (.state | ascii_downcase)}),
+        (select($my_pr) | .comments.nodes[] | select(by_me | not) | . + {kind: "comment"}),
+        ((.comments.nodes[], .reviews.nodes[], (select($my_pr | not) | .reviewThreads.nodes[] | .root.nodes[], .recent.nodes[]))
           | select((by_me | not) and (.body | test("(^|[^\\w-])@" + $me + "(?![\\w-])"; "i")))
           | . + {kind: "mention"}),
-        (.reviewThreads.nodes[]
+        (select($my_pr | not) | .reviewThreads.nodes[]
           | ([.root.nodes[], .recent.nodes[]] | unique_by(.id)) as $thread
           | ([$thread[] | select(by_me) | .createdAt] | min) as $mine
           | select($mine != null)
@@ -140,7 +149,7 @@ comment_events() {
       ]
     | unique_by(.id)[]
     | [.id, .kind, $repo, $number, (.author.login // "ghost"), .url,
-       (.body | gsub("<!--[\\s\\S]*?-->"; "") | gsub("\\s+"; " ") | ltrimstr(" ") | .[0:120])]
+       (.body | gsub("<!--[\\s\\S]*?-->"; "") | gsub("\\s+"; " ") | ltrimstr(" ") | .[0:120]), $title]
     | join("\u001f")' <<<"$1"
 }
 
@@ -364,20 +373,26 @@ while true; do
     [[ ",$labels," == *",$approve_label,"* ]] && maybe_approve "$repo" "$number" "$url" "$title"
   done 3<<<"$prs"
 
-  if [ -f "$comments_file" ]; then
-    while IFS=$sep read -r id kind repo number author url snippet <&3; do
+  if [ -f "$events_file" ]; then
+    while IFS=$sep read -r id kind repo number author url snippet title <&3; do
       [ -z "$id" ] && continue
-      grep -qxF "$id" "$comments_file" && continue
+      grep -qxF "$id" "$events_file" && continue
 
-      verb="replied to you"
-      [ "$kind" = mention ] && verb="mentioned you"
-      log "@$author $verb on $repo#$number: $url"
-      notify "@$author $verb on #$number" "$snippet" "$url"
+      case $kind in
+        approved) verb="approved" ;;
+        changes_requested) verb="requested changes on" ;;
+        commented) verb="commented on" ;;
+        comment) verb="commented on" ;;
+        mention) verb="mentioned you on" ;;
+        *) verb="replied to you on" ;;
+      esac
+      log "@$author $verb $repo#$number: $url"
+      notify "@$author $verb #$number" "${snippet:-$title}" "$url"
     done 3<<<"$events"
   fi
-  { [ -f "$comments_file" ] && cat "$comments_file"; cut -d"$sep" -f1 <<<"$events"; } |
-    sed '/^$/d' | awk '!seen[$0]++' | tail -n 5000 >"$comments_file.tmp"
-  mv "$comments_file.tmp" "$comments_file"
+  { [ -f "$events_file" ] && cat "$events_file"; cut -d"$sep" -f1 <<<"$events"; } |
+    sed '/^$/d' | awk '!seen[$0]++' | tail -n 5000 >"$events_file.tmp"
+  mv "$events_file.tmp" "$events_file"
 
   sleep "$interval"
 done
