@@ -1,6 +1,6 @@
 # ssa-watch
 
-Watches open, non-draft GitHub PRs that involve you and:
+Watches open, non-draft GitHub PRs that involve you and (ignoring comments from bot accounts):
 
 - prints them as a table (repo, PR, author, title, review, CI, labels) with clickable links
 - sends a macOS notification when a new PR appears

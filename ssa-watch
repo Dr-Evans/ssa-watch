@@ -105,7 +105,7 @@ fetch_prs() {
     }
     fragment c on Comment {
       id body createdAt
-      author { login }
+      author { login __typename }
       ... on IssueComment { url }
       ... on PullRequestReview { url }
       ... on PullRequestReviewComment { url }
@@ -120,7 +120,7 @@ pr_rows() {
   ] | join("\u001f")' <<<"$1"
 }
 
-# One row per comment or review by someone else that matters to you. On your own PRs:
+# One row per comment or review by someone else (bots excluded) that matters to you. On your own PRs:
 # every conversation comment and every review (inline comments roll up into their
 # review). Elsewhere: @-mentions, and comments following yours in a review thread.
 # Earlier kinds win when a comment matches several.
@@ -148,6 +148,7 @@ comment_events() {
           | . + {kind: "reply"})
       ]
     | unique_by(.id)[]
+    | select(.author.__typename != "Bot")
     | [.id, .kind, $repo, $number, (.author.login // "ghost"), .url,
        (.body | gsub("<!--[\\s\\S]*?-->"; "") | gsub("\\s+"; " ") | ltrimstr(" ") | .[0:120]), $title]
     | join("\u001f")' <<<"$1"
