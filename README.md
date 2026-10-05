@@ -32,6 +32,8 @@ ssa-watch -r owner/repo [-r owner/repo]... [-i seconds] [-l label] [-x path]... 
   -n  dry run: log instead of approving
 ```
 
+Each kind of notification plays its own sound; change them via the `sound_*` constants at the top of the script.
+
 State lives in `~/.cache/ssa-watch`. The first run records existing PRs and comments without notifying.
 
 ## Limits

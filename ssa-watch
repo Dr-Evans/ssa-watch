@@ -56,21 +56,31 @@ else
   c_reset="" c_bold="" c_dim="" c_red="" c_green="" c_yellow="" c_magenta="" c_cyan=""
 fi
 
+# macOS sound names, from /System/Library/Sounds or ~/Library/Sounds
+sound_new_pr="Glass"
+sound_approved="Hero"
+sound_changes_requested="Basso"
+sound_comment="Pop"
+sound_mention="Ping"
+sound_reply="Tink"
+sound_auto_approved="Purr"
+sound_not_approved="Funk"
+
 log() { printf '%s[%s]%s %s\n' "$c_dim" "$(date +%H:%M:%S)" "$c_reset" "$*"; }
 
 notify() {
-  local title=$1 message=$2 url=$3
+  local title=$1 message=$2 url=$3 sound=$4
 
   if command -v terminal-notifier >/dev/null; then
     # Piped: -message parses values starting with brackets, quotes or "<"
-    printf '%s' "$message" | terminal-notifier -title "$title" -open "$url" -sound default >/dev/null ||
+    printf '%s' "$message" | terminal-notifier -title "$title" -open "$url" -sound "$sound" >/dev/null ||
       log "Notification failed: $title"
     return
   fi
 
   osascript -e 'on run argv' \
-    -e 'display notification (item 2 of argv) with title (item 1 of argv) sound name "default"' \
-    -e 'end run' "$title" "$message" || log "Notification failed: $title"
+    -e 'display notification (item 2 of argv) with title (item 1 of argv) sound name (item 3 of argv)' \
+    -e 'end run' "$title" "$message" "$sound" || log "Notification failed: $title"
 }
 
 # Fields are joined by \x1f, not tabs: bash's read collapses consecutive tabs, dropping empty fields
@@ -194,7 +204,7 @@ maybe_approve() {
     [[ $blocked_approvals == *" $url "* ]] && return
     blocked_approvals+="$url "
     log "Not auto-approving $url: changes $(head -n1 <<<"$blocked")"
-    notify "Not auto-approving #$number" "Changes $(head -n1 <<<"$blocked")" "$url"
+    notify "Not auto-approving #$number" "Changes $(head -n1 <<<"$blocked")" "$url" "$sound_not_approved"
     return
   fi
 
@@ -210,7 +220,7 @@ maybe_approve() {
   fi
 
   log "Approved $url"
-  notify "Auto-approved #$number" "$title" "$url"
+  notify "Auto-approved #$number" "$title" "$url" "$sound_auto_approved"
 }
 
 # Pads by character count; printf's %-Ns pads by bytes, which breaks on non-ASCII
@@ -367,7 +377,7 @@ while true; do
 
     if grep -qxF "$url" <<<"$new_urls"; then
       log "New: $url"
-      notify "New PR #$number ($repo)" "$title - by $author" "$url"
+      notify "New PR #$number ($repo)" "$title - by $author" "$url" "$sound_new_pr"
     fi
 
     [ "$author" = "$me" ] && continue
@@ -380,15 +390,14 @@ while true; do
       grep -qxF "$id" "$events_file" && continue
 
       case $kind in
-        approved) verb="approved" ;;
-        changes_requested) verb="requested changes on" ;;
-        commented) verb="commented on" ;;
-        comment) verb="commented on" ;;
-        mention) verb="mentioned you on" ;;
-        *) verb="replied to you on" ;;
+        approved) verb="approved" sound=$sound_approved ;;
+        changes_requested) verb="requested changes on" sound=$sound_changes_requested ;;
+        commented | comment) verb="commented on" sound=$sound_comment ;;
+        mention) verb="mentioned you on" sound=$sound_mention ;;
+        *) verb="replied to you on" sound=$sound_reply ;;
       esac
       log "@$author $verb $repo#$number: $url"
-      notify "@$author $verb #$number" "${snippet:-$title}" "$url"
+      notify "@$author $verb #$number" "${snippet:-$title}" "$url" "$sound"
     done 3<<<"$events"
   fi
   { [ -f "$events_file" ] && cat "$events_file"; cut -d"$sep" -f1 <<<"$events"; } |
