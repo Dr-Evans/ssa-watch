@@ -6,7 +6,7 @@ Watches open, non-draft GitHub PRs that involve you and (ignoring comments from 
 - sends a macOS notification when a new PR appears
 - sends a notification when someone @-mentions you or replies in a review thread you commented in
 - on your own PRs, sends a notification for every comment and review (approved, changes requested, commented)
-- sends a notification when one of your PRs has all required approvals and auto-merge is not yet enabled
+- once one of your PRs has all required approvals, enables auto-merge and notifies you; if someone else left comments (conversation comments, review bodies, or unresolved threads), only notifies you to check them
 - auto-approves PRs labelled `ssa-ship` (not your own, only by `-a` authors if any are given, not where you requested changes, and not if they change files under an `-x` path)
 
 ## Requirements
@@ -31,7 +31,7 @@ ssa-watch -r owner/repo [-r owner/repo]... [-i seconds] [-l label] [-a author]..
   -l  label that triggers auto-approve (default: ssa-ship)
   -a  only auto-approve PRs by this author, repeatable (default: any author)
   -x  never auto-approve PRs changing files under this path, repeatable
-  -n  dry run: log instead of approving
+  -n  dry run: log instead of approving or enabling auto-merge
 ```
 
 Each kind of notification plays its own sound; change them via the `sound_*` constants at the top of the script.

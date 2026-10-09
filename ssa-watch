@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Watch open, non-draft PRs involving you. Notifies on new ones, on @-mentions, on
-# replies in review threads you commented in, on comments and reviews on your PRs, and when your PRs
-# have all required approvals but no auto-merge. Auto-approves PRs carrying the approve
+# replies in review threads you commented in, and on comments and reviews on your PRs. Once your PR has
+# all required approvals, enables auto-merge, or notifies instead if others left comments. Auto-approves PRs carrying the approve
 # label (unless authored by you or not by an -a author, you requested changes, or it touches an -x path).
 set -euo pipefail
 
@@ -13,7 +13,7 @@ Usage: ssa-watch -r owner/repo [-r owner/repo]... [-i seconds] [-l label] [-a au
   -l  label that triggers auto-approve (default: ssa-ship)
   -a  only auto-approve PRs by this author, repeatable (default: any author)
   -x  never auto-approve PRs changing files under this path, repeatable
-  -n  dry run: log instead of approving
+  -n  dry run: log instead of approving or enabling auto-merge
 EOF
 }
 
@@ -70,7 +70,8 @@ sound_mention="Ping"
 sound_reply="Tink"
 sound_auto_approved="Purr"
 sound_not_approved="Funk"
-sound_ready="Submarine"
+sound_auto_merge="Blow"
+sound_approved_with_comments="Submarine"
 
 log() { printf '%s[%s]%s %s\n' "$c_dim" "$(date +%H:%M:%S)" "$c_reset" "$*"; }
 
@@ -105,13 +106,15 @@ fetch_prs() {
             number title url reviewDecision
             autoMergeRequest { enabledAt }
             author { login }
-            repository { nameWithOwner }
+            repository { nameWithOwner viewerDefaultMergeMethod }
             labels(first: 20) { nodes { name } }
             commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
-            comments(last: 30) { nodes { ...c } }
+            comments(last: 30) { totalCount nodes { ...c } }
             reviews(last: 20) { nodes { ...c state comments(first: 1) { totalCount nodes { body } } } }
             reviewThreads(last: 20) {
+              totalCount
               nodes {
+                isResolved
                 root: comments(first: 1) { nodes { ...c } }
                 recent: comments(last: 10) { nodes { ...c } }
               }
@@ -137,11 +140,21 @@ pr_rows() {
   ] | join("\u001f")' <<<"$1"
 }
 
-# Your PRs with all required approvals and auto-merge not yet enabled
+# Your PRs with all required approvals. Comments count if someone else (bots excluded) left a conversation
+# comment, a review body or a comment in an unresolved thread, or if there are more than were fetched.
 ready_prs() {
-  jq -r --arg me "$me" '.data.search.nodes[]
-    | select(.author.login == $me and .reviewDecision == "APPROVED" and .autoMergeRequest == null)
-    | [.repository.nameWithOwner, (.number | tostring), .url, .title]
+  jq -r --arg me "$me" '
+    def by_other: (.author.login // "") != $me and .author.__typename != "Bot";
+    .data.search.nodes[]
+    | select(.author.login == $me and .reviewDecision == "APPROVED")
+    | (.comments.totalCount > (.comments.nodes | length)
+        or .reviewThreads.totalCount > (.reviewThreads.nodes | length)
+        or any(.comments.nodes[]; by_other)
+        or any(.reviews.nodes[]; by_other and .body != "")
+        or any(.reviewThreads.nodes[] | select(.isResolved | not) | .root.nodes[], .recent.nodes[]; by_other)
+      ) as $has_comments
+    | [.repository.nameWithOwner, (.number | tostring), .url, (.autoMergeRequest != null | tostring),
+       ($has_comments | tostring), .repository.viewerDefaultMergeMethod, .title]
     | join("\u001f")' <<<"$1"
 }
 
@@ -247,6 +260,24 @@ maybe_approve() {
 
   log "Approved $url"
   notify "Auto-approved #$number" "$title" "$url" "$sound_auto_approved"
+}
+
+enable_auto_merge() {
+  local repo=$1 number=$2 url=$3 method=$4 title=$5
+
+  if $dry_run; then
+    log "DRY RUN: would enable auto-merge on $url"
+    return
+  fi
+
+  if ! gh pr merge "$number" -R "$repo" --auto "--${method,,}" >/dev/null; then
+    log "Auto-merge failed for $url, not retrying"
+    notify "Auto-merge failed #$number" "$title" "$url" "$sound_not_approved"
+    return
+  fi
+
+  log "Enabled auto-merge on $url"
+  notify "Auto-merge enabled #$number" "$title" "$url" "$sound_auto_merge"
 }
 
 # Pads by character count; printf's %-Ns pads by bytes, which breaks on non-ASCII
@@ -411,14 +442,21 @@ while true; do
     [[ ",$labels," == *",$approve_label,"* ]] && maybe_approve "$repo" "$number" "$url" "$title"
   done 3<<<"$prs"
 
+  # Acts once per approval, so auto-merge you disable yourself stays off
   ready=$(ready_prs "$raw")
   if [ -f "$ready_file" ]; then
-    while IFS=$sep read -r repo number url title <&3; do
+    while IFS=$sep read -r repo number url auto_merge has_comments merge_method title <&3; do
       [ -z "$url" ] && continue
       grep -qxF "$url" "$ready_file" && continue
+      [ "$auto_merge" = true ] && continue
 
-      log "Ready to merge: $url"
-      notify "Ready to merge #$number ($repo)" "$title" "$url" "$sound_ready"
+      if [ "$has_comments" = true ]; then
+        log "Approved with comments, not enabling auto-merge: $url"
+        notify "Approved #$number, check comments" "$title" "$url" "$sound_approved_with_comments"
+        continue
+      fi
+
+      enable_auto_merge "$repo" "$number" "$url" "$merge_method" "$title"
     done 3<<<"$ready"
   fi
   cut -d"$sep" -f3 <<<"$ready" | sed '/^$/d' >"$ready_file"
