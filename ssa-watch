@@ -7,13 +7,14 @@ set -euo pipefail
 
 usage() {
   cat <<EOF
-Usage: ssa-watch -r owner/repo [-r owner/repo]... [-i seconds] [-l label] [-a author]... [-x path]... [-n]
+Usage: ssa-watch -r owner/repo [-r owner/repo]... [-i seconds] [-l label] [-a author]... [-x path]... [-n] [-h]
   -r  repo to watch, repeatable (required)
   -i  poll interval in seconds (default: 60)
   -l  label that triggers auto-approve (default: ssa-ship)
   -a  only auto-approve PRs by this author, repeatable (default: any author)
   -x  never auto-approve PRs changing files under this path, repeatable
   -n  dry run: log instead of approving or enabling auto-merge
+  -h, --help  show this help
 EOF
 }
 
@@ -24,7 +25,7 @@ approved_authors=()
 excluded_paths=()
 dry_run=false
 
-while getopts "r:i:l:a:x:nh" opt; do
+while getopts "r:i:l:a:x:nh-:" opt; do
   case $opt in
     r) repos+=("$OPTARG") ;;
     i) interval=$OPTARG ;;
@@ -33,6 +34,7 @@ while getopts "r:i:l:a:x:nh" opt; do
     x) excluded_paths+=("${OPTARG%/}") ;;
     n) dry_run=true ;;
     h) usage; exit 0 ;;
+    -) [ "$OPTARG" = help ] || { usage; exit 1; }; usage; exit 0 ;;
     *) usage; exit 1 ;;
   esac
 done

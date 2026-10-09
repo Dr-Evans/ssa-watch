@@ -25,13 +25,14 @@ ln -s "$PWD/ssa-watch" ~/.local/bin/ssa-watch
 ## Usage
 
 ```
-ssa-watch -r owner/repo [-r owner/repo]... [-i seconds] [-l label] [-a author]... [-x path]... [-n]
+ssa-watch -r owner/repo [-r owner/repo]... [-i seconds] [-l label] [-a author]... [-x path]... [-n] [-h]
   -r  repo to watch, repeatable (required)
   -i  poll interval in seconds (default: 60)
   -l  label that triggers auto-approve (default: ssa-ship)
   -a  only auto-approve PRs by this author, repeatable (default: any author)
   -x  never auto-approve PRs changing files under this path, repeatable
   -n  dry run: log instead of approving or enabling auto-merge
+  -h, --help  show this help
 ```
 
 Each kind of notification plays its own sound; change them via the `sound_*` constants at the top of the script.
