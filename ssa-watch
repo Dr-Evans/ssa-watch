@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Watch open, non-draft PRs involving you. Notifies on new ones, on @-mentions, on
 # replies in review threads you commented in, and on comments and reviews on your PRs. Auto-approves PRs carrying the approve
-# label (unless authored by you, you requested changes, or it touches an -x path).
+# label (unless authored by you or not by an -a author, you requested changes, or it touches an -x path).
 set -euo pipefail
 
 usage() {
   cat <<EOF
-Usage: ssa-watch -r owner/repo [-r owner/repo]... [-i seconds] [-l label] [-x path]... [-n]
+Usage: ssa-watch -r owner/repo [-r owner/repo]... [-i seconds] [-l label] [-a author]... [-x path]... [-n]
   -r  repo to watch, repeatable (required)
   -i  poll interval in seconds (default: 60)
   -l  label that triggers auto-approve (default: ssa-ship)
+  -a  only auto-approve PRs by this author, repeatable (default: any author)
   -x  never auto-approve PRs changing files under this path, repeatable
   -n  dry run: log instead of approving
 EOF
@@ -18,14 +19,16 @@ EOF
 repos=()
 interval=60
 approve_label="ssa-ship"
+approved_authors=()
 excluded_paths=()
 dry_run=false
 
-while getopts "r:i:l:x:nh" opt; do
+while getopts "r:i:l:a:x:nh" opt; do
   case $opt in
     r) repos+=("$OPTARG") ;;
     i) interval=$OPTARG ;;
     l) approve_label=$OPTARG ;;
+    a) approved_authors+=("${OPTARG,,}") ;;
     x) excluded_paths+=("${OPTARG%/}") ;;
     n) dry_run=true ;;
     h) usage; exit 0 ;;
@@ -162,6 +165,17 @@ comment_events() {
     | [.id, .kind, $repo, $number, (.author.login // "ghost"), .url,
        (.body | gsub("<!--[\\s\\S]*?-->"; "") | gsub("\\s+"; " ") | ltrimstr(" ") | .[0:120]), $title]
     | join("\u001f")' <<<"$1"
+}
+
+# GitHub logins are case-insensitive
+is_approved_author() {
+  local author
+  [ ${#approved_authors[@]} -eq 0 ] && return 0
+
+  for author in "${approved_authors[@]}"; do
+    [ "$author" = "${1,,}" ] && return 0
+  done
+  return 1
 }
 
 my_review_state() {
@@ -349,7 +363,7 @@ print_list() {
   border └ ┴ ┘
 }
 
-log "Watching ${repos[*]} as $me every ${interval}s (auto-approve: $approve_label)"
+log "Watching ${repos[*]} as $me every ${interval}s (auto-approve: $approve_label${approved_authors[*]:+ by ${approved_authors[*]}})"
 first_poll=true
 
 while true; do
@@ -381,6 +395,7 @@ while true; do
     fi
 
     [ "$author" = "$me" ] && continue
+    is_approved_author "$author" || continue
     [[ ",$labels," == *",$approve_label,"* ]] && maybe_approve "$repo" "$number" "$url" "$title"
   done 3<<<"$prs"
 
