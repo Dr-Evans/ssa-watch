@@ -6,6 +6,7 @@ Watches open, non-draft GitHub PRs that involve you and (ignoring comments from 
 - sends a macOS notification when a new PR appears
 - sends a notification when someone @-mentions you or replies in a review thread you commented in
 - on your own PRs, sends a notification for every comment and review (approved, changes requested, commented)
+- sends a notification when one of your PRs has all required approvals and auto-merge is not yet enabled
 - auto-approves PRs labelled `ssa-ship` (not your own, only by `-a` authors if any are given, not where you requested changes, and not if they change files under an `-x` path)
 
 ## Requirements

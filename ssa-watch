@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Watch open, non-draft PRs involving you. Notifies on new ones, on @-mentions, on
-# replies in review threads you commented in, and on comments and reviews on your PRs. Auto-approves PRs carrying the approve
+# replies in review threads you commented in, on comments and reviews on your PRs, and when your PRs
+# have all required approvals but no auto-merge. Auto-approves PRs carrying the approve
 # label (unless authored by you or not by an -a author, you requested changes, or it touches an -x path).
 set -euo pipefail
 
@@ -44,6 +45,7 @@ state_dir="${XDG_CACHE_HOME:-$HOME/.cache}/ssa-watch"
 repos_key=$(printf '%s\n' "${repos[@]}" | sort | shasum | cut -c1-12)
 seen_file="$state_dir/seen-$repos_key"
 events_file="$state_dir/events-$repos_key"
+ready_file="$state_dir/ready-$repos_key"
 mkdir -p "$state_dir"
 
 me=$(gh api user -q .login)
@@ -68,6 +70,7 @@ sound_mention="Ping"
 sound_reply="Tink"
 sound_auto_approved="Purr"
 sound_not_approved="Funk"
+sound_ready="Submarine"
 
 log() { printf '%s[%s]%s %s\n' "$c_dim" "$(date +%H:%M:%S)" "$c_reset" "$*"; }
 
@@ -100,6 +103,7 @@ fetch_prs() {
         nodes {
           ... on PullRequest {
             number title url reviewDecision
+            autoMergeRequest { enabledAt }
             author { login }
             repository { nameWithOwner }
             labels(first: 20) { nodes { name } }
@@ -131,6 +135,14 @@ pr_rows() {
     ([.labels.nodes[].name] | join(",")), (.reviewDecision // ""),
     (.commits.nodes[0].commit.statusCheckRollup.state // ""), .title
   ] | join("\u001f")' <<<"$1"
+}
+
+# Your PRs with all required approvals and auto-merge not yet enabled
+ready_prs() {
+  jq -r --arg me "$me" '.data.search.nodes[]
+    | select(.author.login == $me and .reviewDecision == "APPROVED" and .autoMergeRequest == null)
+    | [.repository.nameWithOwner, (.number | tostring), .url, .title]
+    | join("\u001f")' <<<"$1"
 }
 
 # One row per comment or review by someone else (bots excluded) that matters to you. On your own PRs:
@@ -398,6 +410,18 @@ while true; do
     is_approved_author "$author" || continue
     [[ ",$labels," == *",$approve_label,"* ]] && maybe_approve "$repo" "$number" "$url" "$title"
   done 3<<<"$prs"
+
+  ready=$(ready_prs "$raw")
+  if [ -f "$ready_file" ]; then
+    while IFS=$sep read -r repo number url title <&3; do
+      [ -z "$url" ] && continue
+      grep -qxF "$url" "$ready_file" && continue
+
+      log "Ready to merge: $url"
+      notify "Ready to merge #$number ($repo)" "$title" "$url" "$sound_ready"
+    done 3<<<"$ready"
+  fi
+  cut -d"$sep" -f3 <<<"$ready" | sed '/^$/d' >"$ready_file"
 
   if [ -f "$events_file" ]; then
     while IFS=$sep read -r id kind repo number author url snippet title <&3; do
